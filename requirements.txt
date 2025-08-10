@@ -2,3 +2,4 @@ fastapi
 uvicorn
 requests
 groq>=0.9.0
+flask
