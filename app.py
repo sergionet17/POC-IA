@@ -1,4 +1,3 @@
-# app.py
 import os, json, csv, re, requests
 from datetime import datetime
 from fastapi import FastAPI, Request, Query
@@ -13,41 +12,111 @@ FALLBACK_TEMPLATE = os.getenv("FALLBACK_TEMPLATE")   # ej: hello_world
 FALLBACK_LANG     = os.getenv("FALLBACK_LANG", "es_ES")
 
 app = FastAPI()
-
-# ========= IA: Groq =========
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+# ========= Dominio (menú) =========
+MENU = {
+    "pizza": {
+        "tamanos": ["personal","mediana","grande"],
+        "precio":  {"personal":18000,"mediana":32000,"grande":42000}
+    },
+    "hamburguesa": {
+        "tamanos": ["sencilla","doble"],
+        "precio":  {"sencilla":23000,"doble":29000}
+    },
+    "gaseosa": {
+        "tamanos": ["350ml","1.5l"],
+        "precio":  {"350ml":6000,"1.5l":9000}
+    },
+    "papas": {
+        "tamanos": ["pequeñas","grandes"],
+        "precio":  {"pequeñas":8000,"grandes":12000}
+    },
+}
+ALIASES = {
+    "coca cola":"gaseosa","coca-cola":"gaseosa","coca":"gaseosa","refresco":"gaseosa",
+    "burger":"hamburguesa","hamburguesas":"hamburguesa","pizzas":"pizza"
+}
+def norm_item(nombre:str)->str:
+    n = (nombre or "").strip().lower()
+    return ALIASES.get(n, n)
+
+QTY_RE  = re.compile(r"(\d+)")
+SIZE_RE = re.compile(r"\b(personal|mediana|grande|sencilla|doble|350ml|1\.5l|pequeñas|grandes)\b", re.I)
+
+def coerce_items(items:list)->list:
+    """Corrige nombres, cantidades y tamaños contra el MENÚ."""
+    fixed=[]
+    for it in items or []:
+        nombre = norm_item(it.get("nombre",""))
+        qty    = it.get("cantidad") or 1
+        tam    = (it.get("tamano") or "").lower().strip()
+
+        # cantidad desde texto si vino rara
+        if isinstance(qty, str):
+            m = QTY_RE.search(qty)
+            qty = int(m.group(1)) if m else 1
+
+        # si no hay tamaño, intenta sacarlo del nombre ("pizza grande")
+        if not tam:
+            m = SIZE_RE.search(nombre)
+            if m:
+                tam = m.group(1).lower()
+                nombre = norm_item(SIZE_RE.sub("", nombre)).strip()
+
+        # valida tamaño contra menú
+        if nombre in MENU and tam and tam not in MENU[nombre]["tamanos"]:
+            tam = ""  # tamaño inválido → pedir confirmación luego
+
+        fixed.append({"nombre": nombre, "cantidad": max(1, int(qty)), "tamano": tam})
+    return fixed
+
+# ========= IA (Groq) =========
 SYSTEM_PROMPT = (
-    "Eres un asistente de un restaurante. Devuelve SOLO JSON con la forma exacta:\n"
+    "Eres un asistente de restaurante. Extrae intención e items y RESPONDE SOLO JSON válido.\n"
+    "Esquema:\n"
     "{"
     "\"intent\":\"pedido|menu|promo|queja|saludo|otro\","
     "\"items\":[{\"nombre\":\"\",\"cantidad\":1,\"tamano\":\"\"}],"
     "\"notas\":\"\","
-    "\"reply\":\"<texto breve y amable>\""
+    "\"reply\":\"\""
     "}\n"
-    "Interpreta jerga coloquial. Si solo saludan: intent='saludo' y sugiere ver menú o repetir pedido."
+    "Reglas: no inventes tamaños ni productos; si faltan, deja \"tamano\":\"\". "
+    "Si solo saludan, intent='saludo'. Sé breve y amable."
 )
+FEWSHOTS = [
+    {"user":"Quiero 2 hamburguesas dobles y una coca cola 1.5L",
+     "json":{"intent":"pedido","items":[
+        {"nombre":"hamburguesa","cantidad":2,"tamano":"doble"},
+        {"nombre":"gaseosa","cantidad":1,"tamano":"1.5l"}],
+        "notas":"","reply":"Recibido: 2 hamburguesas dobles y 1 gaseosa 1.5l. ¿Algo más?"}},
+    {"user":"hola",
+     "json":{"intent":"saludo","items":[],"notas":"","reply":"¡Hola! ¿Quieres ver el menú o repetir tu último pedido?"}},
+    {"user":"qué promos hay?",
+     "json":{"intent":"promo","items":[],"notas":"","reply":"Tenemos combo pizza + gaseosa con 15% OFF. ¿Te lo envío?"}},
+]
 
-def llm_parse(user_text: str, nombre: str = "") -> dict | None:
-    """Parsea con Groq (Llama3-8B). Devuelve dict o None si falla/no hay API key."""
+def llm_parse(user_text:str, nombre:str="")->dict|None:
     if not groq_client:
         return None
     try:
-        prompt = f"{SYSTEM_PROMPT}\nUsuario:{nombre}\nMensaje:{user_text}\nDevuelve SOLO JSON."
+        examples = "\n".join([
+            f"Usuario: {e['user']}\nSalida: {json.dumps(e['json'], ensure_ascii=False)}"
+            for e in FEWSHOTS
+        ])
+        prompt = f"{SYSTEM_PROMPT}\n\nEjemplos:\n{examples}\n\nUsuario:{nombre}\nMensaje:{user_text}\nSalida:"
         r = groq_client.chat.completions.create(
             model="llama3-8b-8192",
-            messages=[
-                {"role": "system", "content": "Devuelve JSON válido exactamente con el esquema indicado."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.1,  # determinista
         )
-        return json.loads(r.choices[0].message.content)
+        out = r.choices[0].message.content.strip()
+        return json.loads(out)
     except Exception as e:
         print("Groq error:", e)
         return None
 
-# ========= Reglas (backup) =========
+# ========= Reglas (backup si IA falla) =========
 GREET_RE = re.compile(r"\b(hola|buen[oa]s|qué tal|que tal|hello|hi)\b", re.I)
 PROMO_RE = re.compile(r"\b(promo|promoción|descuento|oferta|cup[oó]n)\b", re.I)
 QUEJA_RE = re.compile(r"\b(mal[o]|reclamo|queja|tarde|fr[ií]o|demorad[oa])\b", re.I)
@@ -63,10 +132,10 @@ def rule_parse(txt: str) -> dict:
     if PROMO_RE.search(t):
         return {"intent":"promo","items":[],"notas":"","reply":"Hoy tenemos combo 🍕 + 🥤 con 15% OFF. ¿Te lo envío?"}
     if MENU_RE.search(t):
-        return {"intent":"menu","items":[],"notas":"","reply":"Menú: pizzas, hamburguesas, bebidas y postres. ¿Qué se te antoja?"}
+        return {"intent":"menu","items":[],"notas":"","reply":"Menú: pizza, hamburguesa, gaseosa y papas. ¿Qué te antoja?"}
     if PEDIDO_RE.search(t):
-        return {"intent":"pedido","items":[],"notas":"","reply":"¡Perfecto! Dime producto, tamaño y cantidad. Ej: '2 hamburguesas grandes y 1 gaseosa'."}
-    return {"intent":"otro","items":[],"notas":"","reply":"¿Te gustaría ver el menú, conocer las promos o hacer un pedido?"}
+        return {"intent":"pedido","items":[],"notas":"","reply":"¡Perfecto! Dime producto, tamaño y cantidad. Ej: '2 hamburguesas dobles y 1 gaseosa 350ml'."}
+    return {"intent":"otro","items":[],"notas":"","reply":"¿Te ayudo con menú, promos o un pedido?"}
 
 # ========= WhatsApp helpers =========
 def wa_api_url():
@@ -80,7 +149,7 @@ def send_text(to_wa: str, body: str):
     data = {"messaging_product":"whatsapp","to":to_wa,"type":"text","text":{"body":body}}
     r = requests.post(wa_api_url(), headers=headers, json=data, timeout=20)
     print("SEND TEXT RESP:", r.status_code, r.text)
-    # fuera de 24h → plantilla fallback (code 470)
+    # fuera de 24h → plantilla
     try:
         if r.status_code == 400:
             err = r.json().get("error", {})
@@ -105,6 +174,45 @@ def log_event_csv(wa_id: str, text: str, parsed: dict):
             csv.writer(f).writerow([datetime.utcnow().isoformat(), wa_id, text, json.dumps(parsed, ensure_ascii=False)])
     except Exception as e:
         print("No se pudo escribir CSV:", e)
+
+# ========= Lógica de respuesta =========
+def build_business_reply(parsed:dict)->str:
+    intent = parsed.get("intent","otro")
+    items  = coerce_items(parsed.get("items",[]))
+
+    # Si es pedido, verificar tamaños y calcular total
+    if intent=="pedido" and items:
+        faltan = [it for it in items if it["nombre"] in MENU and MENU[it["nombre"]]["tamanos"] and not it["tamano"]]
+        if faltan:
+            nombres = ", ".join({it["nombre"] for it in faltan})
+            # sugerir opciones del primero que falte
+            opciones = " / ".join(MENU[faltan[0]["nombre"]]["tamanos"])
+            return f"¿Qué tamaño para {nombres}? Opciones: {opciones}."
+
+        total = 0
+        lineas=[]
+        for it in items:
+            n,t,q = it["nombre"], it["tamano"], it["cantidad"]
+            if n in MENU:
+                precio = MENU[n]["precio"].get(t, 0)
+                total += precio * q
+                lineas.append(f"{q}x {n} {t}".strip())
+            else:
+                lineas.append(f"{q}x {n}".strip())
+        det = ", ".join(lineas)
+        return f"Confirmo: {det}. Total aprox ${total:,.0f}. ¿Confirmas el pedido? (sí/no)"
+
+    # Otras intenciones
+    if intent=="menu":
+        return "Menú: pizza (personal/mediana/grande), hamburguesa (sencilla/doble), gaseosa (350ml/1.5L) y papas (pequeñas/grandes). ¿Qué te antoja?"
+    if intent=="promo":
+        return "Hoy: combo pizza mediana + gaseosa 350ml con 15% OFF. ¿Te lo envío?"
+    if intent=="queja":
+        return "Lamento lo ocurrido. ¿Me compartes tu número de pedido y qué pasó para ayudarte?"
+    if intent=="saludo":
+        return "¡Hola! ¿Quieres ver el menú o repetir tu último pedido?"
+
+    return parsed.get("reply") or "¿Te ayudo con menú, promos o hacer un pedido?"
 
 # ========= Webhook verify =========
 @app.get("/webhook")
@@ -137,16 +245,17 @@ async def receive(request: Request):
         text   = (msg.get("text") or {}).get("body", "")
         nombre = value.get("contacts", [{}])[0].get("profile", {}).get("name", "")
 
-        # 1) IA con Groq → si falla, reglas
+        # 1) IA → si falla, reglas
         parsed = llm_parse(text, nombre) or rule_parse(text)
 
         # 2) Guardar historial
         log_event_csv(wa_id, text, parsed)
 
-        # 3) Responder
-        reply = parsed.get("reply") or "¿Te ayudo con menú, promos o un pedido?"
-        send_text(wa_id, reply)
+        # 3) Construir respuesta con lógica de negocio
+        reply = build_business_reply(parsed)
 
+        # 4) Enviar
+        send_text(wa_id, reply)
         return {"status":"ok"}
 
     except Exception as e:
