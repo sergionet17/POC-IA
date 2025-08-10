@@ -2,3 +2,4 @@ fastapi
 uvicorn
 requests
 openai>=1.40.0
+groq>=0.9.0
