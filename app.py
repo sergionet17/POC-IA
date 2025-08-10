@@ -1,3 +1,4 @@
+# app.py
 import os, json, csv, re, requests
 from datetime import datetime
 from fastapi import FastAPI, Request, Query
@@ -5,14 +6,26 @@ from groq import Groq
 
 # ========= Config =========
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mipoc123")
-WA_TOKEN     = os.getenv("WA_TOKEN")                 # token WhatsApp
-PHONE_ID     = os.getenv("PHONE_ID")                 # ej: 7160799...
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")             # clave Groq
+WA_TOKEN     = os.getenv("WA_TOKEN")
+PHONE_ID     = os.getenv("PHONE_ID")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FALLBACK_TEMPLATE = os.getenv("FALLBACK_TEMPLATE")   # ej: hello_world
 FALLBACK_LANG     = os.getenv("FALLBACK_LANG", "es_ES")
 
 app = FastAPI()
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# ========= Estado simple por usuario (POC) =========
+SESSIONS = {}  # wa_id -> {"pending": {"field": "size", "item": {...}}}
+
+def get_session(wa_id):
+    return SESSIONS.setdefault(wa_id, {"pending": None})
+
+def set_pending_size(wa_id, item):
+    SESSIONS.setdefault(wa_id, {})["pending"] = {"field": "size", "item": item}
+
+def clear_pending(wa_id):
+    SESSIONS.setdefault(wa_id, {})["pending"] = None
 
 # ========= Dominio (menú) =========
 MENU = {
@@ -41,6 +54,7 @@ def norm_item(nombre:str)->str:
     n = (nombre or "").strip().lower()
     return ALIASES.get(n, n)
 
+PRODUCT_WORDS = set(list(MENU.keys()) + list(ALIASES.keys()))
 QTY_RE  = re.compile(r"(\d+)")
 SIZE_RE = re.compile(r"\b(personal|mediana|grande|sencilla|doble|350ml|1\.5l|pequeñas|grandes)\b", re.I)
 
@@ -52,24 +66,35 @@ def coerce_items(items:list)->list:
         qty    = it.get("cantidad") or 1
         tam    = (it.get("tamano") or "").lower().strip()
 
-        # cantidad desde texto si vino rara
         if isinstance(qty, str):
-            m = QTY_RE.search(qty)
-            qty = int(m.group(1)) if m else 1
+            m = QTY_RE.search(qty); qty = int(m.group(1)) if m else 1
 
-        # si no hay tamaño, intenta sacarlo del nombre ("pizza grande")
         if not tam:
             m = SIZE_RE.search(nombre)
             if m:
                 tam = m.group(1).lower()
                 nombre = norm_item(SIZE_RE.sub("", nombre)).strip()
 
-        # valida tamaño contra menú
         if nombre in MENU and tam and tam not in MENU[nombre]["tamanos"]:
-            tam = ""  # tamaño inválido → pedir confirmación luego
-
-        fixed.append({"nombre": nombre, "cantidad": max(1, int(qty)), "tamano": tam})
+            tam = ""  # tamaño inválido → pedir confirmación
+        fixed.append({"nombre": nombre, "cantidad": max(1,int(qty)), "tamano": tam})
     return fixed
+
+def extract_items_from_text(txt: str):
+    """Saca items aunque el usuario solo diga 'la pizza', '2 dobles', etc."""
+    t = txt.lower()
+    items = []
+    for w in PRODUCT_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", t):
+            nombre = norm_item(w)
+            # cantidad antes de la palabra
+            before = t.split(w)[0][-4:]
+            qty_m = QTY_RE.search(before)
+            qty = int(qty_m.group(1)) if qty_m else 1
+            size_m = SIZE_RE.search(t)
+            tam = size_m.group(1).lower() if size_m else ""
+            items.append({"nombre": nombre, "cantidad": qty, "tamano": tam})
+    return items
 
 # ========= IA (Groq) =========
 SYSTEM_PROMPT = (
@@ -94,6 +119,9 @@ FEWSHOTS = [
      "json":{"intent":"saludo","items":[],"notas":"","reply":"¡Hola! ¿Quieres ver el menú o repetir tu último pedido?"}},
     {"user":"qué promos hay?",
      "json":{"intent":"promo","items":[],"notas":"","reply":"Tenemos combo pizza + gaseosa con 15% OFF. ¿Te lo envío?"}},
+    {"user":"La pizza",
+     "json":{"intent":"pedido","items":[{"nombre":"pizza","cantidad":1,"tamano":""}],
+        "notas":"","reply":"¿Qué tamaño para la pizza? Opciones: personal / mediana / grande."}},
 ]
 
 def llm_parse(user_text:str, nombre:str="")->dict|None:
@@ -108,7 +136,7 @@ def llm_parse(user_text:str, nombre:str="")->dict|None:
         r = groq_client.chat.completions.create(
             model="llama3-8b-8192",
             messages=[{"role":"user","content":prompt}],
-            temperature=0.1,  # determinista
+            temperature=0.1,
         )
         out = r.choices[0].message.content.strip()
         return json.loads(out)
@@ -135,6 +163,10 @@ def rule_parse(txt: str) -> dict:
         return {"intent":"menu","items":[],"notas":"","reply":"Menú: pizza, hamburguesa, gaseosa y papas. ¿Qué te antoja?"}
     if PEDIDO_RE.search(t):
         return {"intent":"pedido","items":[],"notas":"","reply":"¡Perfecto! Dime producto, tamaño y cantidad. Ej: '2 hamburguesas dobles y 1 gaseosa 350ml'."}
+    # detectar solo por producto
+    prod_items = extract_items_from_text(txt)
+    if prod_items:
+        return {"intent":"pedido","items":prod_items,"notas":"","reply":""}
     return {"intent":"otro","items":[],"notas":"","reply":"¿Te ayudo con menú, promos o un pedido?"}
 
 # ========= WhatsApp helpers =========
@@ -143,13 +175,12 @@ def wa_api_url():
 
 def send_text(to_wa: str, body: str):
     if not (WA_TOKEN and PHONE_ID):
-        print("Faltan WA_TOKEN o PHONE_ID.")
-        return None
+        print("Faltan WA_TOKEN o PHONE_ID."); return None
     headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
     data = {"messaging_product":"whatsapp","to":to_wa,"type":"text","text":{"body":body}}
     r = requests.post(wa_api_url(), headers=headers, json=data, timeout=20)
     print("SEND TEXT RESP:", r.status_code, r.text)
-    # fuera de 24h → plantilla
+    # fuera de 24h -> plantilla
     try:
         if r.status_code == 400:
             err = r.json().get("error", {})
@@ -176,21 +207,20 @@ def log_event_csv(wa_id: str, text: str, parsed: dict):
         print("No se pudo escribir CSV:", e)
 
 # ========= Lógica de respuesta =========
-def build_business_reply(parsed:dict)->str:
+def build_business_reply(parsed:dict, wa_id:str)->str:
     intent = parsed.get("intent","otro")
     items  = coerce_items(parsed.get("items",[]))
 
-    # Si es pedido, verificar tamaños y calcular total
+    # Pedido: validar tamaños y calcular total
     if intent=="pedido" and items:
         faltan = [it for it in items if it["nombre"] in MENU and MENU[it["nombre"]]["tamanos"] and not it["tamano"]]
         if faltan:
+            set_pending_size(wa_id, faltan[0])  # guardar pendiente
             nombres = ", ".join({it["nombre"] for it in faltan})
-            # sugerir opciones del primero que falte
             opciones = " / ".join(MENU[faltan[0]["nombre"]]["tamanos"])
             return f"¿Qué tamaño para {nombres}? Opciones: {opciones}."
 
-        total = 0
-        lineas=[]
+        total = 0; lineas=[]
         for it in items:
             n,t,q = it["nombre"], it["tamano"], it["cantidad"]
             if n in MENU:
@@ -202,7 +232,6 @@ def build_business_reply(parsed:dict)->str:
         det = ", ".join(lineas)
         return f"Confirmo: {det}. Total aprox ${total:,.0f}. ¿Confirmas el pedido? (sí/no)"
 
-    # Otras intenciones
     if intent=="menu":
         return "Menú: pizza (personal/mediana/grande), hamburguesa (sencilla/doble), gaseosa (350ml/1.5L) y papas (pequeñas/grandes). ¿Qué te antoja?"
     if intent=="promo":
@@ -227,6 +256,10 @@ def verify(
     return {"error":"not verified"}
 
 # ========= Webhook receive =========
+ONLY_SIZE_RE = re.compile(r"^(personal|mediana|grande|sencilla|doble|350ml|1\.5l|pequeñas|grandes)$", re.I)
+YES_RE = re.compile(r"^(si|sí|claro|dale)$", re.I)
+NO_RE  = re.compile(r"^(no|cancelar)$", re.I)
+
 @app.post("/webhook")
 async def receive(request: Request):
     body = await request.json()
@@ -245,16 +278,45 @@ async def receive(request: Request):
         text   = (msg.get("text") or {}).get("body", "")
         nombre = value.get("contacts", [{}])[0].get("profile", {}).get("name", "")
 
-        # 1) IA → si falla, reglas
+        # ---- Estado: ¿esperábamos tamaño?
+        sess = get_session(wa_id)
+        m_size = ONLY_SIZE_RE.match(text.strip().lower())
+        if sess.get("pending", {}).get("field") == "size" and m_size:
+            size = m_size.group(1).lower()
+            item = sess["pending"]["item"]
+            item["tamano"] = size
+            clear_pending(wa_id)
+
+            items = coerce_items([item])
+            n,t,q = items[0]["nombre"], items[0]["tamano"], items[0]["cantidad"]
+            precio = MENU[n]["precio"].get(t, 0)
+            total = precio * q
+            send_text(wa_id, f"Perfecto: {q}x {n} {t}. Total aprox ${total:,.0f}. ¿Confirmas el pedido? (sí/no)")
+            return {"status":"ok"}
+
+        # confirmación/cancelación rápida
+        if YES_RE.match(text.strip().lower()):
+            clear_pending(wa_id)
+            send_text(wa_id, "¡Pedido confirmado! 🧾 En breve te llegará el resumen y el tiempo estimado.")
+            return {"status":"ok"}
+        if NO_RE.match(text.strip().lower()):
+            clear_pending(wa_id)
+            send_text(wa_id, "Sin problema. ¿Quieres ver el menú o probar la promo del día?")
+            return {"status":"ok"}
+
+        # ---- IA → si falla, reglas
         parsed = llm_parse(text, nombre) or rule_parse(text)
 
-        # 2) Guardar historial
-        log_event_csv(wa_id, text, parsed)
+        # Guardar historial
+        try:
+            with open("events.csv","a",newline="",encoding="utf-8") as f:
+                csv.writer(f).writerow([datetime.utcnow().isoformat(), wa_id, text, json.dumps(parsed, ensure_ascii=False)])
+        except Exception as e:
+            print("No se pudo escribir CSV:", e)
 
-        # 3) Construir respuesta con lógica de negocio
-        reply = build_business_reply(parsed)
+        # Construir respuesta (puede dejar pendiente tamaño)
+        reply = build_business_reply(parsed, wa_id)
 
-        # 4) Enviar
         send_text(wa_id, reply)
         return {"status":"ok"}
 
